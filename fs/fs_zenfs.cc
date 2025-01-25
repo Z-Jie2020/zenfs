@@ -20,6 +20,7 @@
 #include <sstream>
 #include <utility>
 #include <vector>
+#include <fstream>
 
 #ifdef ZENFS_EXPORT_PROMETHEUS
 #include "metrics_prometheus.h"
@@ -251,6 +252,10 @@ ZenFS::ZenFS(ZonedBlockDevice* zbd, std::shared_ptr<FileSystem> aux_fs,
   Info(logger_, "ZenFS initializing");
   next_file_id_ = 1;
   metadata_writer_.zenFS = this;
+
+  run_wl_worker_ = true;
+  wl_worker_.reset(new std::thread(&ZenFS::WLWorker, this));
+
 }
 
 ZenFS::~ZenFS() {
@@ -264,9 +269,229 @@ ZenFS::~ZenFS() {
     gc_worker_->join();
   }
 
+  if (wl_worker_) {
+    run_wl_worker_ = false;
+    wl_worker_->join();
+  }
+
+  std::string reset_count_string;
+  EncodeIOZoneResetCountTo(&reset_count_string);
+  PersistRecord(reset_count_string);
+
   meta_log_.reset(nullptr);
   ClearFiles();
   delete zbd_;
+}
+
+inline bool ends_with(std::string const& value, std::string const& ending) {
+  if (ending.size() > value.size()) return false;
+  return std::equal(ending.rbegin(), ending.rend(), value.rbegin());
+}
+
+void ZenFS::WLWorker() {
+  while (run_wl_worker_) {
+
+    if (zbd_->IsWLSleep()) {
+      std::unique_lock<std::mutex> wl_lock(zbd_->wl_worker_mutex_);
+      zbd_->wl_worker_cv_.wait_for(wl_lock, std::chrono::seconds(60));
+      if (zbd_->IsWLSleep()) {
+        continue;
+      }
+    }
+    zbd_->wl_worker_sleep_ = true;
+
+    double reset_count_std_dev = zbd_->GetResetCountStdDev();
+    if (reset_count_std_dev - reset_std_dev_threshold_ > eps) {
+      zbd_->reset_std_dev_level_ = true;
+      while (1) {
+        if (zbd_->JudgeQpsTrend() != 1){
+          zbd_->idle_qps_fail_count_++;
+          if (zbd_->idle_qps_successive_count_ != 0) {
+            zbd_->idle_qps_successive_count_ = 0;
+          }
+          continue;
+        }
+        else if (zbd_->JudgeQpsTrend() == 1){
+          zbd_->idle_qps_successive_count_++;
+          if (zbd_->idle_qps_fail_count_ != 0) {
+            zbd_->idle_qps_fail_count_ = 0;
+          }
+          break;
+        }
+          
+      }
+
+      zbd_->wl_trigger_count_++;
+
+      Zone* least_reset_count_zone = nullptr;
+      IOStatus status_least_reset_zone =
+          zbd_->GetLeastResetCountZone(&least_reset_count_zone);
+      if (status_least_reset_zone.ok()) {
+        uint64_t least_reset_count_zone_start = least_reset_count_zone->start_;
+        std::vector<ZoneExtentSnapshot*> least_reset_count_zone_extents;
+
+        ZenFSSnapshot snapshot;
+        ZenFSSnapshotOptions options;
+        options.zone_file_ = 1;
+        options.log_garbage_ = 1;
+        GetZenFSSnapshot(snapshot, options);
+        for (auto& ext : snapshot.extents_) {
+          if (ext.zone_start == least_reset_count_zone_start) {
+            least_reset_count_zone_extents.push_back(&ext);
+          }
+        }
+
+        if (least_reset_count_zone_extents.size() > 0) {
+          Info(logger_, "Wear leveling migrate %d extents \n",
+               (int)least_reset_count_zone_extents.size());
+          IOStatus status_migrate_data =
+              WLMigrateExtents(least_reset_count_zone_extents);
+          if (!status_migrate_data.ok()) {
+            Error(logger_, "Wear leveling migrate zone extents failed");
+            continue;
+          }
+          Info(logger_, "Wear leveling migrate zone extents success");
+          continue;
+        } else {
+          Error(logger_, "Get least reset count zone extents failed");
+          continue;
+        }
+      } else {
+        Error(logger_, "Get least reset count zone failed");
+        continue;
+      }
+    } else {
+      zbd_->wl_trigger_count_ = 0;
+      zbd_->reset_std_dev_level_ = false;
+      continue;
+    }
+  }
+}
+
+void ZenFS::EnableWearLeveling() {
+  Info(logger_, "Starting wear leveling worker");
+  run_wl_worker_ = true;
+  wl_worker_.reset(new std::thread(&ZenFS::WLWorker, this));
+}
+
+void ZenFS::DisableWearLeveling() {
+  run_wl_worker_ = false;
+  wl_worker_->join();
+}
+
+IOStatus ZenFS::WLMigrateExtents(const std::vector<ZoneExtentSnapshot*>& extents){
+  IOStatus s;
+  std::map<std::string, std::vector<ZoneExtentSnapshot*>> file_extents;
+
+  for (auto* ext : extents) {
+    std::string fname = ext->filename;
+    if (ends_with(fname, ".sst")) {
+      file_extents[fname].emplace_back(ext);
+    }
+  }
+
+  for (const auto& it : file_extents) {
+    s = WLMigrateFileExtents(it.first, it.second);
+    if (!s.ok()) break;
+    s = zbd_->ResetUnusedIOZones();
+    if (!s.ok()) break;
+  }
+  return s;
+}
+
+IOStatus ZenFS::WLMigrateFileExtents(
+    const std::string& fname,
+    const std::vector<ZoneExtentSnapshot*>& migrate_exts) {
+  IOStatus s = IOStatus::OK();
+  Info(logger_, "MigrateFileExtents, fname: %s, extent count: %lu",
+       fname.data(), migrate_exts.size());
+
+  // 将信息写入文件，用于分析
+  std::ofstream outmigfile;
+  outmigfile.open("/home/zhengjie/re_migfile.txt",
+              std::ios::out | std::ios::app);  // 以追加的方式打开文件
+  if (!outmigfile.is_open()) {
+    printf("Open re_migfile file failed");
+  }
+  outmigfile << "****************************************" << std::endl;
+  // outmigfile << "MigrateFileExtents filename: " << fname << std::endl;
+  // outmigfile << "extent count: " << migrate_exts.size() << std::endl;
+  outmigfile << "extent length: " << migrate_exts[0]->length << std::endl;
+  outmigfile << "****************************************" << std::endl;
+  outmigfile << std::endl;
+  outmigfile.close();
+
+  auto zfile = GetFile(fname);
+  if (zfile == nullptr) {
+    return IOStatus::OK();
+  }
+
+  if (!zfile->TryAcquireWRLock()) {
+    return IOStatus::OK();
+  }
+
+  std::vector<ZoneExtent*> new_extent_list;
+  std::vector<ZoneExtent*> extents = zfile->GetExtents();
+  for (const auto* ext : extents) {
+    new_extent_list.push_back(
+        new ZoneExtent(ext->start_, ext->length_, ext->zone_));
+  }
+
+  for (ZoneExtent* ext : new_extent_list) {
+    auto it = std::find_if(migrate_exts.begin(), migrate_exts.end(),
+                           [&](const ZoneExtentSnapshot* ext_snapshot) {
+                             return ext_snapshot->start == ext->start_ &&
+                                    ext_snapshot->length == ext->length_;
+                           });
+
+    if (it == migrate_exts.end()) {
+      Info(logger_, "Migrate extent not found, ext_start: %lu", ext->start_);
+      continue;
+    }
+
+    Zone* target_zone = nullptr;
+    s = zbd_->GetMigrateTargetZone(&target_zone, zfile->GetWriteLifeTimeHint(), ext->length_);
+
+    if (!s.ok()) {
+      continue;
+    }
+
+    if (target_zone == nullptr) {
+      zbd_->ReleaseMigrateZone(target_zone);
+      Info(logger_, "Zone For Migrate Acquire Failed, Ignore Task.");
+      continue;
+    }
+
+    uint64_t target_start = target_zone->wp_;
+    if (zfile->IsSparse()) {
+      target_start = target_zone->wp_ + ZoneFile::SPARSE_HEADER_SIZE;
+      zfile->MigrateData(ext->start_ - ZoneFile::SPARSE_HEADER_SIZE,
+                         ext->length_ + ZoneFile::SPARSE_HEADER_SIZE,
+                         target_zone);
+      zbd_->AddGCBytesWritten(ext->length_ + ZoneFile::SPARSE_HEADER_SIZE);
+    } else {
+      zfile->MigrateData(ext->start_, ext->length_, target_zone);
+      zbd_->AddGCBytesWritten(ext->length_);
+    }
+
+    if (GetFileNoLock(fname) == nullptr) {
+      Info(logger_, "Migrate file not exist anymore.");
+      zbd_->ReleaseMigrateZone(target_zone);
+      break;
+    }
+
+    ext->start_ = target_start;
+    ext->zone_ = target_zone;
+    ext->zone_->used_capacity_ += ext->length_;
+
+    zbd_->ReleaseMigrateZone(target_zone);
+  }
+  SyncFileExtents(zfile.get(), new_extent_list);
+  zfile->ReleaseWRLock();
+
+  Info(logger_, "MigrateFileExtents Finished, fname: %s, extent count: %lu",
+       fname.data(), migrate_exts.size());
+  return IOStatus::OK();
 }
 
 void ZenFS::GCWorker() {
@@ -331,6 +556,19 @@ IOStatus ZenFS::Repair() {
   }
 
   return IOStatus::OK();
+}
+
+void ZenFS::RebuildZoneLifeTime() {
+  std::map<std::string, std::shared_ptr<ZoneFile>>::iterator it;
+  for (it = files_.begin(); it != files_.end(); it++) {
+    std::shared_ptr<ZoneFile> zFile = it->second;
+    std::vector<ZoneExtent*> extents = zFile->GetExtents();
+    Env::WriteLifeTimeHint file_lifetime = zFile->GetWriteLifeTimeHint();
+    for (const auto* ext : extents) {
+      Zone* zone = ext->zone_;
+      if (zone->lifetime_ < file_lifetime) zone->lifetime_ = file_lifetime;
+    }
+  }
 }
 
 std::string ZenFS::FormatPathLexically(fs::path filepath) {
@@ -625,10 +863,10 @@ IOStatus ZenFS::NewRandomAccessFile(const std::string& filename,
   return IOStatus::OK();
 }
 
-inline bool ends_with(std::string const& value, std::string const& ending) {
-  if (ending.size() > value.size()) return false;
-  return std::equal(ending.rbegin(), ending.rend(), value.rbegin());
-}
+// inline bool ends_with(std::string const& value, std::string const& ending) {
+//   if (ending.size() > value.size()) return false;
+//   return std::equal(ending.rbegin(), ending.rend(), value.rbegin());
+// }
 
 IOStatus ZenFS::NewWritableFile(const std::string& filename,
                                 const FileOptions& file_opts,
@@ -1263,6 +1501,32 @@ Status ZenFS::DecodeFileDeletionFrom(Slice* input) {
   return Status::OK();
 }
 
+void ZenFS::EncodeIOZoneResetCountTo(std::string* output){
+  std::string reset_count_string;
+  uint32_t *reset_count = zbd_->GetIOZonesResetCountArray();
+  uint32_t io_zones_count = zbd_->GetNrIOZones();
+
+  PutFixed32(output, kIOZoneResetCount);
+  for (uint32_t i = 0; i < io_zones_count; i++) {
+    PutFixed32(output, reset_count[i]);
+  }
+}
+
+Status ZenFS::DecodeIOZoneResetCountFrom(Slice* slice){
+  uint32_t io_zones_count = zbd_->GetNrIOZones();
+  uint32_t reset_count[io_zones_count];
+
+  for (uint32_t i = 0; i < io_zones_count; i++) {
+    if (!GetFixed32(slice, &reset_count[i]))
+      return Status::Corruption("IO zone reset count: missing reset count");
+  }
+
+  zbd_->SetIOZonesResetCount(reset_count);
+  zbd_->SetTotalResetCount();
+
+  return Status::OK();
+}
+
 Status ZenFS::RecoverFrom(ZenMetaLog* log) {
   bool at_least_one_snapshot = false;
   std::string scratch;
@@ -1284,52 +1548,62 @@ Status ZenFS::RecoverFrom(ZenMetaLog* log) {
 
     if (tag == kEndRecord) break;
 
-    if (!GetLengthPrefixedSlice(&record, &data)) {
-      return Status::Corruption("ZenFS", "No recovery record data");
-    }
+    if (tag == kIOZoneResetCount) {
+      s = DecodeIOZoneResetCountFrom(&record);
+      if (!s.ok()) {
+        Warn(logger_, "Could not decode IO zone reset count: %s",
+             s.ToString().c_str());
+        return s;
+      }
+    } else {
+      if (!GetLengthPrefixedSlice(&record, &data)) {
+        return Status::Corruption("ZenFS", "No recovery record data");
+      }
 
-    switch (tag) {
-      case kCompleteFilesSnapshot:
-        ClearFiles();
-        s = DecodeSnapshotFrom(&data);
-        if (!s.ok()) {
-          Warn(logger_, "Could not decode complete snapshot: %s",
-               s.ToString().c_str());
-          return s;
-        }
-        at_least_one_snapshot = true;
-        break;
+      switch (tag) {
+        case kCompleteFilesSnapshot:
+          ClearFiles();
+          s = DecodeSnapshotFrom(&data);
+          if (!s.ok()) {
+            Warn(logger_, "Could not decode complete snapshot: %s",
+                s.ToString().c_str());
+            return s;
+          }
+          at_least_one_snapshot = true;
+          break;
 
-      case kFileUpdate:
-        s = DecodeFileUpdateFrom(&data);
-        if (!s.ok()) {
-          Warn(logger_, "Could not decode file snapshot: %s",
-               s.ToString().c_str());
-          return s;
-        }
-        break;
+        case kFileUpdate:
+          s = DecodeFileUpdateFrom(&data);
+          if (!s.ok()) {
+            Warn(logger_, "Could not decode file snapshot: %s",
+                s.ToString().c_str());
+            return s;
+          }
+          break;
 
-      case kFileReplace:
-        s = DecodeFileUpdateFrom(&data, true);
-        if (!s.ok()) {
-          Warn(logger_, "Could not decode file snapshot: %s",
-               s.ToString().c_str());
-          return s;
-        }
-        break;
+        case kFileReplace:
+          s = DecodeFileUpdateFrom(&data, true);
+          if (!s.ok()) {
+            Warn(logger_, "Could not decode file snapshot: %s",
+                s.ToString().c_str());
+            return s;
+          }
+          break;
 
-      case kFileDeletion:
-        s = DecodeFileDeletionFrom(&data);
-        if (!s.ok()) {
-          Warn(logger_, "Could not decode file deletion: %s",
-               s.ToString().c_str());
-          return s;
-        }
-        break;
+        case kFileDeletion:
+          s = DecodeFileDeletionFrom(&data);
+          if (!s.ok()) {
+            Warn(logger_, "Could not decode file deletion: %s",
+                s.ToString().c_str());
+            return s;
+          }
+          break;
 
-      default:
-        Warn(logger_, "Unexpected metadata record tag: %u", tag);
-        return Status::Corruption("ZenFS", "Unexpected tag");
+        default:
+          Warn(logger_, "Unexpected metadata record tag: %u", tag);
+          printf("Unexpected metadata record tag: %u\n", tag);
+          return Status::Corruption("ZenFS", "Unexpected tag aaaaa");
+      }
     }
   }
 
@@ -1470,6 +1744,8 @@ Status ZenFS::Mount(bool readonly) {
       return s;
     }
   }
+
+  RebuildZoneLifeTime();
 
   Info(logger_, "Superblock sequence %d", (int)superblock_->GetSeq());
   Info(logger_, "Finish threshold %u", superblock_->GetFinishTreshold());

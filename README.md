@@ -38,7 +38,7 @@ $ git clone https://github.com/westerndigitalcorporation/zenfs plugin/zenfs
 
 Build and install rocksdb with zenfs enabled:
 ```
-$ DEBUG_LEVEL=0 ROCKSDB_PLUGINS=zenfs make -j48 db_bench install
+$ sudo DEBUG_LEVEL=0 ROCKSDB_PLUGINS=zenfs make -j48 db_bench install
 ```
 
 Build the zenfs utility:

@@ -17,6 +17,7 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <unistd.h>
+#include <math.h>
 
 #include <cstdlib>
 #include <fstream>
@@ -59,6 +60,7 @@ Zone::Zone(ZonedBlockDevice *zbd, ZonedBlockDeviceBackend *zbd_be,
   lifetime_ = Env::WLTH_NOT_SET;
   used_capacity_ = 0;
   capacity_ = 0;
+  reset_count_ = 0;
   if (zbd_be->ZoneIsWritable(zones, idx))
     capacity_ = max_capacity_ - (wp_ - start_);
 }
@@ -68,6 +70,10 @@ uint64_t Zone::GetCapacityLeft() { return capacity_; }
 bool Zone::IsFull() { return (capacity_ == 0); }
 bool Zone::IsEmpty() { return (wp_ == start_); }
 uint64_t Zone::GetZoneNr() { return start_ / zbd_->GetZoneSize(); }
+uint32_t Zone::GetResetCount() { return reset_count_.load(); }
+void Zone::SetResetCount(uint32_t reset_count) { reset_count_ = reset_count; }
+uint64_t Zone::GetCapacityUsed() { return used_capacity_.load(); }
+Env::WriteLifeTimeHint Zone::GetLifeTimeHint() { return lifetime_; }
 
 void Zone::EncodeJson(std::ostream &json_stream) {
   json_stream << "{";
@@ -76,13 +82,16 @@ void Zone::EncodeJson(std::ostream &json_stream) {
   json_stream << "\"max_capacity\":" << max_capacity_ << ",";
   json_stream << "\"wp\":" << wp_ << ",";
   json_stream << "\"lifetime\":" << lifetime_ << ",";
-  json_stream << "\"used_capacity\":" << used_capacity_;
+  json_stream << "\"used_capacity\":" << used_capacity_ << ",";
+  json_stream << "\"reset_count\":" << reset_count_;
   json_stream << "}";
 }
 
 IOStatus Zone::Reset() {
   bool offline;
   uint64_t max_capacity;
+  uint32_t io_zones_reset_count;
+  uint32_t reset_count_diff;
 
   assert(!IsUsed());
   assert(IsBusy());
@@ -98,7 +107,42 @@ IOStatus Zone::Reset() {
   wp_ = start_;
   lifetime_ = Env::WLTH_NOT_SET;
 
+  reset_count_++;              
+  zbd_->total_reset_count_++;  
+
+  io_zones_reset_count = zbd_->GetTotalResetCount() - zbd_->GetMetaZoneResetCountNow();
+  if (zbd_->GetTotalResetCount() > zbd_->GetNrZones()) {
+    if (zbd_->GetCheckResetCount() < zbd_->GetNrZones()) {
+      zbd_->SetCheckResetCount(zbd_->GetNrZones());
+    }
+    reset_count_diff = io_zones_reset_count - zbd_->GetCheckResetCount();
+    if ((100 * reset_count_diff >
+         io_zones_reset_count * zbd_->reset_ratio_threshold_) &&
+        (reset_count_diff >= zbd_->GetNrZones())) {
+      if (zbd_->wl_trigger_count_ >= 2) {
+        zbd_->wl_trigger_count_ = 0; 
+        double reset_count_std_dev = zbd_->GetResetCountStdDev();
+        zbd_->reset_ratio_threshold_ = zbd_->reset_ratio_threshold_ /
+                                       (1 + (reset_count_std_dev - 1.5) / 1.5);
+      }
+      zbd_->WakeupWLWorker();
+      zbd_->SetCheckResetCount(io_zones_reset_count);
+    }
+  }
+
   return IOStatus::OK();
+}
+
+uint64_t Zone::GetZoneReclaimableSpace() {
+  uint64_t reclaimable = 0;
+
+  if (IsFull()) {
+    reclaimable = max_capacity_ - used_capacity_;
+  } else {
+    reclaimable = wp_ - start_ - used_capacity_;
+  }
+
+  return reclaimable;
 }
 
 IOStatus Zone::Finish() {
@@ -128,6 +172,8 @@ IOStatus Zone::Append(char *data, uint32_t size) {
   ZenFSMetricsLatencyGuard guard(zbd_->GetMetrics(), ZENFS_ZONE_WRITE_LATENCY,
                                  Env::Default());
   zbd_->GetMetrics()->ReportThroughput(ZENFS_ZONE_WRITE_THROUGHPUT, size);
+  zbd_->GetMetricsQps()->ReportQPS(ZENFS_WRITE_QPS, 1);
+
   char *ptr = data;
   uint32_t left = size;
   int ret;
@@ -174,6 +220,9 @@ ZonedBlockDevice::ZonedBlockDevice(std::string path, ZbdBackendType backend,
                                    std::shared_ptr<Logger> logger,
                                    std::shared_ptr<ZenFSMetrics> metrics)
     : logger_(logger), metrics_(metrics) {
+  total_reset_count_ = 0;
+  check_reset_count_ = 0;
+  metrics_qps_ = std::make_shared<ZenFSMetricsQps>(Env::Default());
   if (backend == ZbdBackendType::kBlockDev) {
     zbd_be_ = std::unique_ptr<ZbdlibBackend>(new ZbdlibBackend(path));
     Info(logger_, "New Zoned Block Device: %s", zbd_be_->GetFilename().c_str());
@@ -183,6 +232,187 @@ ZonedBlockDevice::ZonedBlockDevice(std::string path, ZbdBackendType backend,
   }
 }
 
+uint32_t ZonedBlockDevice::GetIOZoneResetCountNow() {
+  uint32_t total = 0;
+  for (const auto z : io_zones) {
+    total += z->reset_count_;
+  }
+  return total;
+}
+
+uint32_t* ZonedBlockDevice::GetIOZonesResetCountArray() {
+  uint32_t *reset_count = new uint32_t[GetNrIOZones()];
+  int i = 0;
+  for (const auto z : io_zones) {
+    reset_count[i] = z->reset_count_;
+    i++;
+  }
+  return reset_count;
+}
+
+void ZonedBlockDevice::SetIOZonesResetCount(uint32_t *reset_count) {
+  int i = 0;
+  for (const auto z : io_zones) {
+    z->reset_count_ = reset_count[i];
+    i++;
+  }
+}
+
+uint32_t ZonedBlockDevice::GetMetaZoneResetCountNow() {
+  uint32_t total = 0;
+  for (const auto z : meta_zones) {
+    total += z->reset_count_;
+  }
+  return total;
+}
+
+void ZonedBlockDevice::SleepWLWorker() {
+  std::unique_lock<std::mutex> wl_lock(wl_worker_mutex_);
+  wl_worker_sleep_ = true;
+}
+
+void ZonedBlockDevice::WakeupWLWorker() {
+  std::unique_lock<std::mutex> wl_lock(wl_worker_mutex_);
+  wl_worker_cv_.notify_one();
+  wl_worker_sleep_ = false;
+}
+
+double ZonedBlockDevice::GetResetCountStdDev() {
+  double mean = 0.0;
+  double sum = 0.0;
+  double variance = 0.0;
+  int n = io_zones.size();
+
+  mean = GetIOZoneResetCountNow() / n;
+  for (const auto z : io_zones) {
+    sum += pow(z->reset_count_ - mean, 2);
+  }
+  variance = sum / n;
+  double std_dev = sqrt(variance);
+
+  return std_dev;
+}
+
+IOStatus ZonedBlockDevice::GetLeastResetCountZone(Zone **out_zone) {
+  Zone *least_reset_count_zone = nullptr;
+  uint64_t least_reset_count_zone_score = 0;
+
+  for (const auto z : io_zones) {
+    if (z->IsEmpty()) {
+      continue;
+    }
+    if (z->IsUsed()) {
+      if (z->lifetime_ == Env::WLTH_EXTREME) {
+        uint64_t reclaimable_space = z->GetZoneReclaimableSpace();
+        if (reclaimable_space != 0) {
+          uint64_t zone_score =
+              z->reset_count_ * z->max_capacity_ / reclaimable_space;
+          if (least_reset_count_zone == nullptr ||
+              zone_score < least_reset_count_zone_score ||
+              (zone_score == least_reset_count_zone_score &&
+               reclaimable_space >
+                   least_reset_count_zone->GetZoneReclaimableSpace())) {
+            least_reset_count_zone = z;
+            least_reset_count_zone_score = zone_score;
+          }
+        } else {
+          continue;
+        }
+      }
+    }
+  }
+  *out_zone = least_reset_count_zone;
+  if ((*out_zone) == nullptr) {
+    return IOStatus::NotFound("The zone with the fewest resets was not found");
+  }
+  return IOStatus::OK();
+}
+
+void ZonedBlockDevice::GetLifetimeZeroZone(std::vector<Zone *> &zero_lifetime_zones) {
+  for (auto z : io_zones) {
+    if (z->IsUsed()) {
+      if (z->GetLifeTimeHint() == Env::WLTH_NOT_SET) {
+        zero_lifetime_zones.push_back(z);
+      }
+    }
+  }
+}
+
+int ZonedBlockDevice::JudgeQpsTrend() {
+
+  ClearNowQps();
+  usleep(1000 * 100);
+  uint64_t qps_write1 = GetNowWriteQps();
+  uint64_t qps_read1 = GetNowReadQps();
+
+  ClearNowQps();
+  usleep(1000 * 100);
+  uint64_t qps_write2 = GetNowWriteQps();
+  uint64_t qps_read2 = GetNowReadQps();
+
+  if (qps_write2 > qps_write1) {
+    if (qps_write2 > window_qps_write_max_) {
+      window_qps_write_max_ = qps_write2;
+    }
+  } else {
+    if (qps_write1 > window_qps_write_max_) {
+      window_qps_write_max_ = qps_write1;
+    }
+  }
+
+  if (qps_read2 > qps_read1) {
+    if (qps_read2 > window_qps_read_max_) {
+      window_qps_read_max_ = qps_read2;
+    }
+  } else {
+    if (qps_read1 > window_qps_read_max_) {
+      window_qps_read_max_ = qps_read1;
+    }
+  }
+
+  if (idle_qps_fail_count_ >= 5) {
+    if (window_qps_write_max_ > idle_qps_write_threshold_){
+      idle_qps_write_threshold_ = (idle_qps_write_threshold_ + window_qps_write_max_) / 2;
+    }
+    if (window_qps_read_max_ > idle_qps_read_threshold_){
+      idle_qps_read_threshold_ = (idle_qps_read_threshold_ + window_qps_read_max_) / 2;
+    }
+    window_qps_write_max_ = 0;
+    window_qps_read_max_ = 0;
+    idle_qps_fail_count_ = 0;
+  }
+
+  if ((idle_qps_write_threshold_ != 76) || (idle_qps_read_threshold_ != 5000)) {
+    if (idle_qps_successive_count_ >= 5) {
+      idle_qps_write_threshold_ = 76;
+      idle_qps_read_threshold_ = 5000;
+      idle_qps_successive_count_ = 0;
+    }
+  }
+
+  if ((qps_write1 < idle_qps_write_threshold_) && (qps_write2 < idle_qps_write_threshold_)) {
+    if ((qps_read1 < idle_qps_read_threshold_) && (qps_read2 < idle_qps_read_threshold_)) {
+      return 1;
+    }
+    if (qps_read2 > qps_read1) {
+      return 0;
+    }
+    if (100 * (qps_read1 - qps_read2) > idle_qps_read_threshold_ * 5) {
+      return 1;
+    }
+  } else {
+    if (qps_write2 > qps_write1) {
+      return 0;
+    }
+    if ((qps_read1 < idle_qps_read_threshold_) && (qps_read2 < idle_qps_read_threshold_)) {
+      if (100 * (qps_write1 - qps_write2) > idle_qps_write_threshold_ * 5) {
+        return 1;
+      }
+    }
+  }
+
+  return 0;
+}
 IOStatus ZonedBlockDevice::Open(bool readonly, bool exclusive) {
   std::unique_ptr<ZoneList> zone_rep;
   unsigned int max_nr_active_zones;
@@ -410,6 +640,116 @@ unsigned int GetLifeTimeDiff(Env::WriteLifeTimeHint zone_lifetime,
   if (zone_lifetime == file_lifetime) return LIFETIME_DIFF_COULD_BE_WORSE;
 
   return LIFETIME_DIFF_NOT_GOOD;
+}
+
+IOStatus ZonedBlockDevice::GetMigrateTargetZone(
+    Zone **out_zone, Env::WriteLifeTimeHint file_lifetime,
+    uint64_t min_capacity) {
+  std::unique_lock<std::mutex> lock(migrate_zone_mtx_);
+  migrate_resource_.wait(lock, [this] { return !migrating_; });
+
+  migrating_ = true;
+
+  Zone *target_zone = nullptr;
+  uint64_t target_zone_score = 0;
+  IOStatus s;
+
+  WaitForOpenIOZoneToken(true);
+  for (const auto z : io_zones) {
+    if (z->Acquire()) {
+      if (z->IsEmpty()) {
+        if (target_zone == nullptr ||
+            z->reset_count_ > target_zone->reset_count_) {
+          if (target_zone != nullptr) {
+            s = target_zone->CheckRelease();
+            if (!s.ok()) {
+              IOStatus s_ = z->CheckRelease();
+              if (!s_.ok()) {
+                PutOpenIOZoneToken();
+                return s_;
+              }
+              PutOpenIOZoneToken();
+              return s;
+            }
+          }
+          target_zone = z;
+        } else {
+          s = z->CheckRelease();
+          if (!s.ok()) {
+            PutOpenIOZoneToken();
+            return s;
+          }
+        }
+      } else {
+        s = z->CheckRelease();
+        if (!s.ok()) {
+          PutOpenIOZoneToken();
+          return s;
+        }
+      }
+    }
+  }
+
+  if (target_zone != nullptr) {
+    bool got_token = GetActiveIOZoneTokenIfAvailable();
+    if (!got_token) {
+      PutOpenIOZoneToken();
+      target_zone->Release();
+      target_zone = nullptr;
+    } else { 
+      assert(target_zone->IsBusy());
+      target_zone->lifetime_ = file_lifetime;
+    }
+  }
+
+  if (target_zone == nullptr) {
+    for (const auto z : io_zones) {
+      if (z->Acquire()) {
+        if ((z->used_capacity_ > 0) && !z->IsFull() &&
+            z->capacity_ >= min_capacity) {
+          uint64_t reclaimable_space = z->GetZoneReclaimableSpace();
+          uint64_t zone_score =
+              z->reset_count_ * reclaimable_space / z->max_capacity_;
+          if (target_zone == nullptr ||
+              zone_score > target_zone_score ||
+              (zone_score == target_zone_score &&
+               z->reset_count_ > target_zone->reset_count_)) {
+            unsigned int diff = GetLifeTimeDiff(z->lifetime_, file_lifetime);
+            if (diff != LIFETIME_DIFF_NOT_GOOD) {
+              if (target_zone != nullptr) {
+                s = target_zone->CheckRelease();
+                if (!s.ok()) {
+                  IOStatus s_ = z->CheckRelease();
+                  if (!s_.ok()) return s_;
+                  return s;
+                }
+              }
+              target_zone = z;
+              target_zone_score = zone_score;
+            } else {
+              s = z->CheckRelease();
+              if (!s.ok()) return s;
+            }
+          } else {
+            s = z->CheckRelease();
+            if (!s.ok()) return s;
+          }
+        } else {
+          s = z->CheckRelease();
+          if (!s.ok()) return s;
+        }
+      }
+    }
+  }
+
+  *out_zone = target_zone;
+  if ((*out_zone) == nullptr) {
+    migrating_ = false;
+    return IOStatus::NotFound("The migrate target zone was not found");
+  } else {
+    Info(logger_, "Take Wear Leveling Migrate Zone: %lu", (*out_zone)->start_);
+    return IOStatus::OK();
+  }
 }
 
 IOStatus ZonedBlockDevice::AllocateMetaZone(Zone **out_meta_zone) {
@@ -646,6 +986,68 @@ IOStatus ZonedBlockDevice::AllocateEmptyZone(Zone **zone_out) {
   *zone_out = allocated_zone;
   return IOStatus::OK();
 }
+IOStatus ZonedBlockDevice::AllocateEmptyZone(Env::WriteLifeTimeHint file_lifetime, Zone **zone_out) {
+  IOStatus s;
+  Zone *allocated_zone = nullptr;
+
+  if (file_lifetime < Env::WLTH_SHORT) {
+    for (const auto z : io_zones) {
+      if (z->Acquire()) {
+        if (z->IsEmpty()) {
+          if (allocated_zone == nullptr ||
+              z->reset_count_ > allocated_zone->reset_count_) {
+            if (allocated_zone != nullptr) {
+              s = allocated_zone->CheckRelease();
+              if (!s.ok()) {
+                IOStatus s_ = z->CheckRelease();
+                if (!s_.ok()) return s_;
+                return s;
+              }
+            }
+            allocated_zone = z;
+          } else {
+            s = z->CheckRelease();
+            if (!s.ok()) return s;
+          }
+        } else {
+          s = z->CheckRelease();
+          if (!s.ok()) return s;
+        }
+      }
+    }
+  } else if(file_lifetime >= Env::WLTH_SHORT) {
+    for (const auto z : io_zones) {
+      if (z->Acquire()) {
+        if (z->IsEmpty()) {
+          if (allocated_zone == nullptr ||
+              z->reset_count_ < allocated_zone->reset_count_) {
+            if (allocated_zone != nullptr) {
+              s = allocated_zone->CheckRelease();
+              if (!s.ok()) {
+                IOStatus s_ = z->CheckRelease();
+                if (!s_.ok()) return s_;
+                return s;
+              }
+            }
+            allocated_zone = z;
+            if (allocated_zone->reset_count_ == 0) {
+              break;
+            }
+          } else {
+            s = z->CheckRelease();
+            if (!s.ok()) return s;
+          }
+        } else {
+          s = z->CheckRelease();
+          if (!s.ok()) return s;
+        }
+      }
+    }
+  }
+
+  *zone_out = allocated_zone;
+  return IOStatus::OK();
+}
 
 IOStatus ZonedBlockDevice::InvalidateCache(uint64_t pos, uint64_t size) {
   int ret = zbd_be_->InvalidateCache(pos, size);
@@ -657,6 +1059,9 @@ IOStatus ZonedBlockDevice::InvalidateCache(uint64_t pos, uint64_t size) {
 }
 
 int ZonedBlockDevice::Read(char *buf, uint64_t offset, int n, bool direct) {
+    
+  metrics_qps_->ReportQPS(ZENFS_READ_QPS, 1);
+ 
   int ret = 0;
   int left = n;
   int r = -1;
@@ -791,7 +1196,8 @@ IOStatus ZonedBlockDevice::AllocateIOZone(Env::WriteLifeTimeHint file_lifetime,
         }
       }
 
-      s = AllocateEmptyZone(&allocated_zone);
+      // s = AllocateEmptyZone(&allocated_zone);
+      s = AllocateEmptyZone(file_lifetime, &allocated_zone);
       if (!s.ok()) {
         PutActiveIOZoneToken();
         PutOpenIOZoneToken();
@@ -837,6 +1243,8 @@ uint32_t ZonedBlockDevice::GetBlockSize() { return zbd_be_->GetBlockSize(); }
 uint64_t ZonedBlockDevice::GetZoneSize() { return zbd_be_->GetZoneSize(); }
 
 uint32_t ZonedBlockDevice::GetNrZones() { return zbd_be_->GetNrZones(); }
+
+uint32_t ZonedBlockDevice::GetNrIOZones() { return zbd_be_->GetNrIOZones(); }
 
 void ZonedBlockDevice::EncodeJsonZone(std::ostream &json_stream,
                                       const std::vector<Zone *> zones) {

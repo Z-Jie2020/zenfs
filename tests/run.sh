@@ -31,6 +31,7 @@ export STRESS_CMD
 OUTPUT_DIR=${OUTPUT_DIR:-results}
 RESULT_PATH="${OUTPUT_DIR}/$NAME"
 RESULT_DIR="${RESULT_PATH}/$TEST_DIR"
+echo "Results will be stored in $RESULT_DIR"
 
 mkdir -p $RESULT_DIR
 rm -rf $RESULT_DIR/*

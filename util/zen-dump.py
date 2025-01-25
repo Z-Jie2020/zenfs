@@ -33,6 +33,7 @@ class Zone:
     wp: int
     lifetime: int
     used_capacity: int
+    reset_count: int
 
 
 DISPLAY_CHARACTERS = list(string.ascii_lowercase + string.digits)
@@ -67,12 +68,12 @@ def size_human(value):
 
 def print_zone(zone):
     print(f"Zone #{zone.zone_id}: start=0x{(zone.start):012x} wp=0x{(zone.wp):012x} remaining_capacity={size_human(zone.capacity)} " +
-          f"max_capacity={size_human(zone.max_capacity)} used_capacity={size_human(zone.used_capacity)} lifetime={zone.lifetime}")
+          f"max_capacity={size_human(zone.max_capacity)} used_capacity={size_human(zone.used_capacity)} lifetime={zone.lifetime} reset_count={zone.reset_count}")
 
 
 def to_zone(input_data):
     idx, zone_json = input_data
-    return Zone(idx, zone_json["start"], zone_json["capacity"], zone_json["max_capacity"], zone_json["wp"], zone_json["lifetime"], zone_json["used_capacity"])
+    return Zone(idx, zone_json["start"], zone_json["capacity"], zone_json["max_capacity"], zone_json["wp"], zone_json["lifetime"], zone_json["used_capacity"], zone_json["reset_count"])
 
 
 def get_meta_zones(data):

@@ -15,6 +15,7 @@ const std::unordered_map<uint32_t, std::pair<std::string, uint32_t>>
         {ZENFS_WRITE_LATENCY,
          {"zenfs_write_latency", ZENFS_REPORTER_TYPE_LATENCY}},
         {ZENFS_WRITE_QPS, {"zenfs_write_qps", ZENFS_REPORTER_TYPE_QPS}},
+        {ZENFS_READ_QPS, {"zenfs_read_qps", ZENFS_REPORTER_TYPE_QPS}},
         {ZENFS_RESETABLE_ZONES_COUNT,
          {"zenfs_resetable_zones", ZENFS_REPORTER_TYPE_GENERAL}}};
 
@@ -65,6 +66,9 @@ struct ZenFSMetricsSample : public ZenFSMetrics {
     for (auto& label_with_type : ZenFSHistogramsNameMap)
       AddReporter(static_cast<uint32_t>(label_with_type.first),
                   static_cast<uint32_t>(label_with_type.second.second));
+    TypeReporter reporter(ZENFS_REPORTER_TYPE_QPS);
+    reporter_map_.emplace(ZENFS_WRITE_QPS, reporter);
+    reporter_map_.emplace(ZENFS_READ_QPS, reporter);
   }
   ~ZenFSMetricsSample() {}
 

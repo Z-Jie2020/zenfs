@@ -22,6 +22,8 @@ AUXPATH=$DEV-aux
 
 sudo rm -rf /tmp/$AUXPATH && sudo ../util/zenfs mkfs $MKFS_ARG --aux_path=/tmp/$AUXPATH --finish_threshold=10 --force
 
+echo "aux path is /tmp/$AUXPATH"
+
 echo "Using URI "$FS_URI
 
 NAME="zenfs-$DEV-baseline_performance"
@@ -29,4 +31,4 @@ NAME="zenfs-$DEV-baseline_performance"
 echo "$(tput setaf 4)Running ZenFS baseline performance tests, results will be stored in results/$NAME $(tput sgr 0)"
 
 DB_BENCH_EXTRA_PARAMS="$GOOD_PARAMS" FS_PARAMS="--fs_uri=$FS_URI" ./run.sh $NAME quick_performance
-DB_BENCH_EXTRA_PARAMS="$GOOD_PARAMS" FS_PARAMS="--fs_uri=$FS_URI" ./run.sh $NAME long_performance
+# DB_BENCH_EXTRA_PARAMS="$GOOD_PARAMS" FS_PARAMS="--fs_uri=$FS_URI" ./run.sh $NAME long_performance

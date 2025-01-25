@@ -15,7 +15,8 @@ zenfs_HEADERS-y = \
 	fs/snapshot.h \
 	fs/filesystem_utility.h \
 	fs/zonefs_zenfs.h \
-	fs/zbdlib_zenfs.h
+	fs/zbdlib_zenfs.h \
+	fs/metrics_qps.h
 
 zenfs_PKGCONFIG_REQUIRES-y += "libzbd >= 1.5.0"
 

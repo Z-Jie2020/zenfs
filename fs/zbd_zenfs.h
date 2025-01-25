@@ -25,6 +25,7 @@
 #include <vector>
 
 #include "metrics.h"
+#include "metrics_qps.h"
 #include "rocksdb/env.h"
 #include "rocksdb/file_system.h"
 #include "rocksdb/io_status.h"
@@ -64,6 +65,7 @@ class Zone {
   uint64_t wp_;
   Env::WriteLifeTimeHint lifetime_;
   std::atomic<uint64_t> used_capacity_;
+  std::atomic<uint32_t> reset_count_;
 
   IOStatus Reset();
   IOStatus Finish();
@@ -75,6 +77,13 @@ class Zone {
   bool IsEmpty();
   uint64_t GetZoneNr();
   uint64_t GetCapacityLeft();
+
+  uint64_t GetCapacityUsed();  
+  Env::WriteLifeTimeHint GetLifeTimeHint(); 
+  uint32_t GetResetCount();
+  void SetResetCount(uint32_t count);
+  uint64_t GetZoneReclaimableSpace();
+
   bool IsBusy() { return this->busy_.load(std::memory_order_relaxed); }
   bool Acquire() {
     bool expected = false;
@@ -131,6 +140,7 @@ class ZonedBlockDeviceBackend {
   uint32_t GetBlockSize() { return block_sz_; };
   uint64_t GetZoneSize() { return zone_sz_; };
   uint32_t GetNrZones() { return nr_zones_; };
+  uint32_t GetNrIOZones() {return nr_zones_ - 3;};
   virtual ~ZonedBlockDeviceBackend(){};
 };
 
@@ -166,7 +176,9 @@ class ZonedBlockDevice {
   unsigned int max_nr_active_io_zones_;
   unsigned int max_nr_open_io_zones_;
 
+  uint32_t last_allocated_zone_ = 0;
   std::shared_ptr<ZenFSMetrics> metrics_;
+  std::shared_ptr<ZenFSMetricsQps> metrics_qps_; 
 
   void EncodeJsonZone(std::ostream &json_stream,
                       const std::vector<Zone *> zones);
@@ -189,6 +201,49 @@ class ZonedBlockDevice {
   uint64_t GetFreeSpace();
   uint64_t GetUsedSpace();
   uint64_t GetReclaimableSpace();
+  
+  void SleepWLWorker(); 
+  void WakeupWLWorker(); 
+
+  std::mutex wl_worker_mutex_;
+  std::condition_variable wl_worker_cv_;
+
+  std::atomic<uint32_t> total_reset_count_; 
+  std::atomic<uint32_t> check_reset_count_;
+  bool reset_std_dev_level_ = false; 
+  bool IsResetStdDevLevel() { return reset_std_dev_level_; }  
+  bool wl_worker_sleep_ = true;
+  bool IsWLSleep() { return wl_worker_sleep_; }  
+  double reset_ratio_threshold_ = 50.0;
+  uint32_t wl_trigger_count_ = 0;
+  uint32_t idle_qps_read_threshold_ = 5000;  
+  uint32_t idle_qps_write_threshold_ = 76;  
+  uint32_t window_qps_read_max_ = 0;  
+  uint32_t window_qps_write_max_ = 0;  
+  uint32_t idle_qps_successive_count_ = 0;  
+  uint32_t idle_qps_fail_count_ = 0;  
+
+  uint32_t GetTotalResetCount() { return total_reset_count_.load(); }
+  void SetTotalResetCount() { total_reset_count_.store(GetIOZoneResetCountNow() + GetMetaZoneResetCountNow()); }
+  uint32_t GetCheckResetCount() { return check_reset_count_.load(); }
+  void SetCheckResetCount(uint32_t count) { check_reset_count_.store(count); }
+
+  uint32_t GetMetaZoneResetCountNow();  
+  uint32_t GetIOZoneResetCountNow();  
+  uint32_t* GetIOZonesResetCountArray();
+  void SetIOZonesResetCount(uint32_t *reset_count);
+  double GetResetCountStdDev();   
+  IOStatus GetLeastResetCountZone(Zone **out_zone);  
+  IOStatus GetMigrateTargetZone(Zone **out_zone, Env::WriteLifeTimeHint file_lifetime,
+      uint64_t min_capacity);  
+
+  std::shared_ptr<ZenFSMetricsQps> GetMetricsQps() { return metrics_qps_; } 
+  uint64_t GetNowQps() { return metrics_qps_->GetQps(); }
+  uint64_t GetNowWriteQps() { return metrics_qps_->GetWriteQps(); }
+  uint64_t GetNowReadQps() { return metrics_qps_->GetReadQps(); }
+  void ClearNowQps() { metrics_qps_->ClearQps(); }
+  int JudgeQpsTrend();
+  void GetLifetimeZeroZone(std::vector<Zone*> &zero_lifetime_zones);
 
   std::string GetFilename();
   uint32_t GetBlockSize();
@@ -200,6 +255,7 @@ class ZonedBlockDevice {
 
   uint64_t GetZoneSize();
   uint32_t GetNrZones();
+  uint32_t GetNrIOZones();
   std::vector<Zone *> GetMetaZones() { return meta_zones; }
 
   void SetFinishTreshold(uint32_t threshold) { finish_threshold_ = threshold; }
@@ -240,6 +296,7 @@ class ZonedBlockDevice {
                                 unsigned int *best_diff_out, Zone **zone_out,
                                 uint32_t min_capacity = 0);
   IOStatus AllocateEmptyZone(Zone **zone_out);
+  IOStatus AllocateEmptyZone(Env::WriteLifeTimeHint file_lifetime, Zone **zone_out);
 };
 
 }  // namespace ROCKSDB_NAMESPACE

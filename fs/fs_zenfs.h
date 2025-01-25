@@ -166,6 +166,7 @@ class ZenFS : public FileSystemWrapper {
     kFileDeletion = 3,
     kEndRecord = 4,
     kFileReplace = 5,
+    kIOZoneResetCount = 6,
   };
 
   void LogFiles();
@@ -194,10 +195,12 @@ class ZenFS : public FileSystemWrapper {
   void EncodeSnapshotTo(std::string* output);
   void EncodeFileDeletionTo(std::shared_ptr<ZoneFile> zoneFile,
                             std::string* output, std::string linkf);
+  void EncodeIOZoneResetCountTo(std::string* output);
 
   Status DecodeSnapshotFrom(Slice* input);
   Status DecodeFileUpdateFrom(Slice* slice, bool replace = false);
   Status DecodeFileDeletionFrom(Slice* slice);
+  Status DecodeIOZoneResetCountFrom(Slice* slice);
 
   Status RecoverFrom(ZenMetaLog* log);
 
@@ -251,6 +254,8 @@ class ZenFS : public FileSystemWrapper {
                             IODebugContext* dbg);
 
   IOStatus Repair();
+  
+  void RebuildZoneLifeTime();
 
   /* Must hold files_mtx_ */
   IOStatus DeleteDirRecursiveNoLock(const std::string& d,
@@ -456,12 +461,28 @@ class ZenFS : public FileSystemWrapper {
   IOStatus MigrateFileExtents(
       const std::string& fname,
       const std::vector<ZoneExtentSnapshot*>& migrate_exts);
+  
+  void EnableWearLeveling();  
+  void DisableWearLeveling(); 
+
+  IOStatus WLMigrateExtents(const std::vector<ZoneExtentSnapshot*>& extents);
+  IOStatus WLMigrateFileExtents(
+      const std::string& fname,
+      const std::vector<ZoneExtentSnapshot*>& migrate_exts);
 
  private:
   const uint64_t GC_START_LEVEL =
       20;                      /* Enable GC when < 20% free space available */
   const uint64_t GC_SLOPE = 3; /* GC agressiveness */
   void GCWorker();
+  
+  std::unique_ptr<std::thread> wl_worker_ = nullptr; 
+  bool run_wl_worker_ = false; 
+  void WLWorker();  
+
+  const double reset_std_dev_threshold_ = 1.5;  
+  const double eps = 1e-5; 
+  
 };
 #endif  // !defined(ROCKSDB_LITE) && defined(OS_LINUX)
 

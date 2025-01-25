@@ -1058,6 +1058,13 @@ IOStatus ZonedSequentialFile::Read(size_t n, const IOOptions& /*options*/,
   return s;
 }
 
+uint64_t ZonedWritableFile::GetFileSize(const IOOptions& options [[maybe_unused]], 
+                                        IODebugContext* debug_context [[maybe_unused]]) {
+    // 返回文件大小的逻辑，临时返回 0 以避免报错
+    return zoneFile_->GetFileSize();
+}
+
+
 IOStatus ZonedSequentialFile::Skip(uint64_t n) {
   if (rp + n >= zoneFile_->GetFileSize())
     return IOStatus::InvalidArgument("Skip beyond end of file");
